@@ -112,7 +112,7 @@ def main():
         "matplotlib.backends",
         "--collect-all",
         "duckdb",
-        str(root / "stock_screener" / "__main__.py"),
+        str(root / "review_screener_portable_main.py"),
     ]
 
     pyinstaller_run(args)
