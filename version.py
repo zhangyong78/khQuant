@@ -1,10 +1,10 @@
 # version.py
 
 VERSION_INFO = {
-    "version": "2.1.3",          # 当前版本号
-    "build_date": "2025-09-16",  # 构建日期
+    "version": "2.2.0",          # 当前版本号
+    "build_date": "2026-04-23",  # 构建日期
     "channel": "stable",         # 更新通道
-    "app_name": "看海量化回测平台" # 应用名称
+    "app_name": "看海量化交易平台" # 应用名称
 }
 
 def get_version():

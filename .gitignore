@@ -61,6 +61,7 @@ celerybeat-schedule
 # 虚拟环境
 .env
 .venv
+.venv311/
 env/
 venv/
 ENV/
@@ -114,6 +115,8 @@ data/*.sqlite3
 backtest_results/
 results/
 reports/
+stock_screener/cache/
+stock_screener/reports/
 
 # 交易记录（敏感）
 trades/
@@ -243,6 +246,7 @@ backup/
 *.7z
 *.tar.gz
 *.tar.bz2
+release/
 
 # 大文件（超过100MB的数据文件）
 *.parquet
