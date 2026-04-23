@@ -149,6 +149,36 @@ class ScanWorker(QObject):
         self.progress.emit(current, total, message)
 
 
+class HistoryScanWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, project_root: Path, params: ReviewParams):
+        super().__init__()
+        self.project_root = Path(project_root)
+        self.params = params
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            engine = ReviewEngine(self.project_root)
+            outcome = engine.screen_history_until_match(
+                self.params,
+                progress_callback=self._emit_progress,
+                is_cancelled=lambda: self._cancelled,
+            )
+            self.finished.emit(outcome)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _emit_progress(self, current: int, total: int, message: str):
+        self.progress.emit(current, total, message)
+
+
 class SyncWorker(QObject):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(object)
@@ -408,6 +438,9 @@ class MainWindow(QMainWindow):
         self.run_button = QPushButton("开始筛选")
         self.run_button.clicked.connect(self.run_scan)
 
+        self.history_scan_button = QPushButton("历史筛查")
+        self.history_scan_button.clicked.connect(self.run_history_scan)
+
         self.stop_button = QPushButton("停止任务")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.cancel_task)
@@ -423,6 +456,7 @@ class MainWindow(QMainWindow):
         self.open_cache_button.clicked.connect(self.open_cache_dir)
 
         controls.addWidget(self.run_button)
+        controls.addWidget(self.history_scan_button)
         controls.addWidget(self.sync_button)
         controls.addWidget(self.stop_button)
         controls.addWidget(self.open_report_button)
@@ -858,6 +892,31 @@ class MainWindow(QMainWindow):
             start_message="开始筛选...",
         )
 
+    def run_history_scan(self):
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.information(self, "正在运行", "当前已有筛选任务在运行，请先等待完成。")
+            return
+
+        self.current_params = self.collect_params()
+        self.current_rows = []
+        self.filtered_rows = []
+        self.current_report_path = ""
+        self.table.setRowCount(0)
+        self._update_filter_status()
+        self.chart_widget.show_message("正在按历史日期回溯筛查，请稍候...")
+        self.result_footer.setText(f"正在从 {self.current_params.signal_date} 开始向前筛查...")
+        self._update_summary({})
+        self.open_report_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self._start_worker(
+            HistoryScanWorker(self.project_root, self.current_params),
+            task_name="history_scan",
+            progress_slot=self.on_scan_progress,
+            finished_slot=self.on_scan_finished,
+            failed_slot=self.on_scan_failed,
+            start_message="开始历史筛查...",
+        )
+
     def run_sync(self):
         if self.worker_thread and self.worker_thread.isRunning():
             QMessageBox.information(self, "正在运行", "当前已有任务在运行，请先等待完成。")
@@ -895,6 +954,7 @@ class MainWindow(QMainWindow):
     def _start_worker(self, worker, task_name: str, progress_slot, finished_slot, failed_slot, start_message: str):
         self.active_task = task_name
         self.run_button.setEnabled(False)
+        self.history_scan_button.setEnabled(False)
         self.sync_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
@@ -919,23 +979,44 @@ class MainWindow(QMainWindow):
         self.result_footer.setText(message)
 
     def on_scan_finished(self, outcome: Dict):
+        summary = outcome.get("summary", {})
         self.current_report_path = outcome.get("report_path", "")
         self.current_rows = outcome.get("rows", [])
         self.current_params = ReviewParams(**outcome.get("params", asdict(self.current_params)))
-        self._update_summary(outcome.get("summary", {}))
+        signal_date = self.current_params.signal_date
+        signal_qdate = QDate.fromString(signal_date, "yyyy-MM-dd")
+        if signal_qdate.isValid():
+            self.signal_date_edit.setDate(signal_qdate)
+        self._update_summary(summary)
         self.apply_result_filters()
 
-        if self.current_rows:
-            self.result_footer.setText(
-                f"共命中 {len(self.current_rows)} 只股票。可在表头上方二次筛选，按上下键翻图。"
-            )
+        if summary.get("history_search"):
+            searched_dates = summary.get("searched_dates", 0)
+            start_signal_date = summary.get("start_signal_date", self.current_params.signal_date)
+            matched_signal_date = summary.get("matched_signal_date", self.current_params.signal_date)
+            if self.current_rows:
+                self.result_footer.setText(
+                    f"从 {start_signal_date} 往前筛查了 {searched_dates} 个交易日，在 {matched_signal_date} 命中 {len(self.current_rows)} 只股票。"
+                )
+                self.statusBar().showMessage("历史筛查完成")
+            else:
+                self.chart_widget.show_message("历史筛查已完成，但本地可用日期范围内没有筛出股票。")
+                self.result_footer.setText(
+                    f"从 {start_signal_date} 往前筛查了 {searched_dates} 个交易日，仍没有筛出股票。"
+                )
+                self.statusBar().showMessage("历史筛查完成")
+        elif self.current_rows:
+            self.result_footer.setText(f"共命中 {len(self.current_rows)} 只股票。可在表头上方二次筛选，按上下键翻图。")
+            self.statusBar().showMessage("筛选完成")
             self.open_report_button.setEnabled(bool(self.current_report_path))
         else:
             self.chart_widget.show_message("本次条件下没有筛出股票。")
             self.result_footer.setText("本次条件下没有筛出股票。")
+            self.statusBar().showMessage("筛选完成")
 
-        self.progress_bar.setValue(100 if self.current_rows else 0)
-        self.statusBar().showMessage("筛选完成")
+        if self.current_rows:
+            self.open_report_button.setEnabled(bool(self.current_report_path))
+        self.progress_bar.setValue(100 if self.current_rows or summary.get("history_search") else 0)
 
     def on_scan_failed(self, message: str):
         if message == "筛选已取消。":
@@ -996,6 +1077,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup_worker(self):
         self.run_button.setEnabled(True)
+        self.history_scan_button.setEnabled(True)
         self.sync_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         if self.worker:

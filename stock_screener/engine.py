@@ -526,47 +526,120 @@ class ReviewEngine:
         is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> Dict:
         params = self._normalize_params(params)
-        total_steps = 4 if params.enable_earnings_filter else 3
 
         with self._connect() as conn:
             self._ensure_database_ready(conn, progress_callback=progress_callback, is_cancelled=is_cancelled)
+            return self._screen_with_conn(conn, params, progress_callback=progress_callback, is_cancelled=is_cancelled)
 
-            if is_cancelled and is_cancelled():
-                raise RuntimeError("筛选已取消。")
+    def screen_history_until_match(
+        self,
+        params: ReviewParams,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> Dict:
+        params = self._normalize_params(params)
+        start_signal_date = params.signal_date
 
-            if progress_callback:
-                progress_callback(1, total_steps, "正在准备股票池...")
-            universe_df = self._load_universe_frame(conn, params.universe, params.signal_date, params.exclude_st)
-            if universe_df.empty:
-                raise RuntimeError("股票池为空，无法筛选。请先同步数据。")
+        with self._connect() as conn:
+            self._ensure_database_ready(conn, progress_callback=progress_callback, is_cancelled=is_cancelled)
+            available_dates = self._load_available_signal_dates(conn, params.signal_date)
+            if not available_dates:
+                raise RuntimeError("本地数据库没有可用于历史筛查的交易日，请先同步日线数据。")
 
-            if is_cancelled and is_cancelled():
-                raise RuntimeError("筛选已取消。")
+            total_dates = len(available_dates)
+            for index, signal_date in enumerate(available_dates, start=1):
+                if is_cancelled and is_cancelled():
+                    raise RuntimeError("筛选已取消。")
 
-            if progress_callback:
-                progress_callback(2, total_steps, "正在从本地数据库读取日线数据...")
-            history = self._load_history_frame(conn, params, universe_df)
-            if history.empty:
-                raise RuntimeError("本地数据库没有命中范围内的历史数据，请先同步对应日期区间。")
-
-            if is_cancelled and is_cancelled():
-                raise RuntimeError("筛选已取消。")
-
-            earnings_df = pd.DataFrame()
-            if params.enable_earnings_filter:
                 if progress_callback:
-                    progress_callback(3, total_steps, "正在准备业绩预告、快报和成长数据...")
-                earnings_df = self._load_latest_earnings_frame(conn, params.signal_date, universe_df)
-                if earnings_df.empty or earnings_df[["forecast_pub_date", "express_pub_date", "growth_pub_date"]].isna().all().all():
-                    raise RuntimeError("当前本地数据库没有可用的业绩数据，请先点击“同步数据”更新。")
+                    progress_callback(index, total_dates, f"[{index}/{total_dates}] 历史筛查 {signal_date} ...")
 
-            if is_cancelled and is_cancelled():
-                raise RuntimeError("筛选已取消。")
+                candidate_params = ReviewParams(**asdict(params))
+                candidate_params.signal_date = signal_date
 
+                try:
+                    outcome = self._screen_with_conn(conn, candidate_params)
+                except RuntimeError as exc:
+                    if self._is_history_scan_skippable_error(str(exc)):
+                        continue
+                    raise
+
+                if outcome["rows"]:
+                    outcome["summary"].update(
+                        {
+                            "history_search": True,
+                            "history_search_exhausted": False,
+                            "searched_dates": index,
+                            "start_signal_date": start_signal_date,
+                            "matched_signal_date": signal_date,
+                        }
+                    )
+                    return outcome
+
+        summary = self._build_summary(pd.DataFrame(), params)
+        summary.update(
+            {
+                "history_search": True,
+                "history_search_exhausted": True,
+                "searched_dates": len(available_dates),
+                "start_signal_date": start_signal_date,
+                "matched_signal_date": "",
+            }
+        )
+        return {
+            "params": asdict(params),
+            "rows": [],
+            "summary": summary,
+            "report_path": "",
+        }
+
+    def _screen_with_conn(
+        self,
+        conn,
+        params: ReviewParams,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> Dict:
+        total_steps = 4 if params.enable_earnings_filter else 3
+
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("筛选已取消。")
+
+        if progress_callback:
+            progress_callback(1, total_steps, "正在准备股票池...")
+        universe_df = self._load_universe_frame(conn, params.universe, params.signal_date, params.exclude_st)
+        if universe_df.empty:
+            raise RuntimeError("股票池为空，无法筛选。请先同步数据。")
+
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("筛选已取消。")
+
+        if progress_callback:
+            progress_callback(2, total_steps, "正在从本地数据库读取日线数据...")
+        history = self._load_history_frame(conn, params, universe_df)
+        if history.empty:
+            raise RuntimeError("本地数据库没有命中范围内的历史数据，请先同步对应日期区间。")
+
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("筛选已取消。")
+
+        earnings_df = pd.DataFrame()
+        if params.enable_earnings_filter:
             if progress_callback:
-                progress_callback(total_steps, total_steps, "正在批量计算条件并生成结果...")
-            result_df = self._evaluate_universe(history, params, earnings_df)
+                progress_callback(3, total_steps, "正在准备业绩预告、快报和成长数据...")
+            earnings_df = self._load_latest_earnings_frame(conn, params.signal_date, universe_df)
+            if earnings_df.empty or earnings_df[["forecast_pub_date", "express_pub_date", "growth_pub_date"]].isna().all().all():
+                raise RuntimeError("当前本地数据库没有可用的业绩数据，请先点击“同步数据”更新。")
 
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("筛选已取消。")
+
+        if progress_callback:
+            progress_callback(total_steps, total_steps, "正在批量计算条件并生成结果...")
+        result_df = self._evaluate_universe(history, params, earnings_df)
+        return self._build_screen_outcome(result_df, params)
+
+    def _build_screen_outcome(self, result_df: pd.DataFrame, params: ReviewParams) -> Dict:
         if result_df.empty:
             return {
                 "params": asdict(params),
@@ -1074,6 +1147,18 @@ class ReviewEngine:
             [code],
         )
 
+    def _begin_transaction(self, conn):
+        conn.execute("BEGIN TRANSACTION")
+
+    def _commit_transaction(self, conn):
+        conn.execute("COMMIT")
+
+    def _rollback_transaction(self, conn):
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+
     def _get_cache_status_from_conn(self, conn) -> Dict[str, str | int]:
         row = conn.execute(
             "SELECT COALESCE(COUNT(*), 0) AS cache_count, MAX(end_date) AS latest_date FROM cache_summary"
@@ -1082,6 +1167,29 @@ class ReviewEngine:
         if row and row[1] is not None:
             latest_date = row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1])
         return {"cache_count": int(row[0]) if row else 0, "latest_date": latest_date}
+
+    def _load_available_signal_dates(self, conn, end_date: str) -> List[str]:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT trade_date
+            FROM daily_bars
+            WHERE trade_date <= ?
+            ORDER BY trade_date DESC
+            """,
+            [end_date],
+        ).fetchall()
+        dates: List[str] = []
+        for (trade_date,) in rows:
+            if trade_date is None:
+                continue
+            dates.append(trade_date.isoformat() if hasattr(trade_date, "isoformat") else str(trade_date))
+        return dates
+
+    def _is_history_scan_skippable_error(self, message: str) -> bool:
+        return message in {
+            "本地数据库没有命中范围内的历史数据，请先同步对应日期区间。",
+            "股票池为空，无法筛选。请先同步数据。",
+        }
 
     def _load_universe_from_source(self, client: BaoStockSession, params: SyncParams) -> List[StockInfo]:
         if params.universe == "all_a":
@@ -1712,10 +1820,16 @@ class ReviewEngine:
         start_date: str,
         end_date: str,
     ):
-        conn.execute("DELETE FROM daily_bars WHERE code = ? AND trade_date BETWEEN ? AND ?", [code, start_date, end_date])
-        if not history.empty:
-            self._merge_history_into_db(conn, history)
-        self._refresh_code_summary(conn, code)
+        self._begin_transaction(conn)
+        try:
+            conn.execute("DELETE FROM daily_bars WHERE code = ? AND trade_date BETWEEN ? AND ?", [code, start_date, end_date])
+            if not history.empty:
+                self._insert_history_rows(conn, history)
+            self._refresh_code_summary(conn, code)
+            self._commit_transaction(conn)
+        except Exception:
+            self._rollback_transaction(conn)
+            raise
 
     def _merge_history_into_db(self, conn, history: pd.DataFrame):
         if history.empty:
@@ -1733,14 +1847,29 @@ class ReviewEngine:
 
         codes = [str(value) for value in insert_df["code"].drop_duplicates().tolist()]
         for code in codes:
-            code_frame = insert_df.loc[insert_df["code"] == code]
-            start_date = code_frame["trade_date"].min().isoformat()
-            end_date = code_frame["trade_date"].max().isoformat()
-            conn.execute(
-                "DELETE FROM daily_bars WHERE code = ? AND trade_date BETWEEN ? AND ?",
-                [code, start_date, end_date],
-            )
-            conn.register("bar_insert_df", code_frame)
+            code_frame = insert_df.loc[insert_df["code"] == code].copy()
+            self._begin_transaction(conn)
+            try:
+                self._insert_history_rows(conn, code_frame)
+                self._refresh_code_summary(conn, code)
+                self._commit_transaction(conn)
+            except Exception:
+                self._rollback_transaction(conn)
+                raise
+
+    def _insert_history_rows(self, conn, insert_df: pd.DataFrame):
+        if insert_df.empty:
+            return
+
+        code = str(insert_df.iloc[0]["code"])
+        start_date = insert_df["trade_date"].min().isoformat()
+        end_date = insert_df["trade_date"].max().isoformat()
+        conn.execute(
+            "DELETE FROM daily_bars WHERE code = ? AND trade_date BETWEEN ? AND ?",
+            [code, start_date, end_date],
+        )
+        conn.register("bar_insert_df", insert_df)
+        try:
             conn.execute(
                 """
                 INSERT INTO daily_bars (code, trade_date, open, high, low, close, volume, amount, turn, pct_chg)
@@ -1748,8 +1877,8 @@ class ReviewEngine:
                 FROM bar_insert_df
                 """
             )
+        finally:
             conn.unregister("bar_insert_df")
-            self._refresh_code_summary(conn, code)
 
     def _build_history_range(self, params: ReviewParams) -> Tuple[str, str]:
         lookback_buffer = max(260, int(params.lookback_days * 1.8))
